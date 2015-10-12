@@ -1,0 +1,191 @@
+diff --git a/include/linux/sysctl.h b/include/linux/sysctl.h
+index 562fc61..b32b171 100644
+--- a/include/linux/sysctl.h
++++ b/include/linux/sysctl.h
+@@ -434,6 +434,7 @@ enum
+ 	NET_TCP_ALLOWED_CONG_CONTROL=123,
+ 	NET_TCP_MAX_SSTHRESH=124,
+ 	NET_TCP_FRTO_RESPONSE=125,
++	NET_IPV4_TCP_TIMEWAIT_LEN=126,
+ };
+ 
+ enum {
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index c8deb06..d5ec828 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -214,6 +214,7 @@ extern struct inet_timewait_death_row tcp_death_row;
+ extern int sysctl_tcp_timestamps;
+ extern int sysctl_tcp_window_scaling;
+ extern int sysctl_tcp_sack;
++extern int sysctl_tcp_timewait_len;
+ extern int sysctl_tcp_fin_timeout;
+ extern int sysctl_tcp_keepalive_time;
+ extern int sysctl_tcp_keepalive_probes;
+diff --git a/kernel/sysctl_check.c b/kernel/sysctl_check.c
+index 40b80d3..ca7054f 100644
+--- a/kernel/sysctl_check.c
++++ b/kernel/sysctl_check.c
+@@ -325,6 +325,7 @@ static const struct trans_ctl_table trans_net_ipv4_table[] = {
+ 	{ NET_IPV4_TCP_KEEPALIVE_PROBES,	"tcp_keepalive_probes" },
+ 	{ NET_IPV4_TCP_RETRIES1,		"tcp_retries1" },
+ 	{ NET_IPV4_TCP_RETRIES2,		"tcp_retries2" },
++	{ NET_IPV4_TCP_TIMEWAIT_LEN,		"tcp_timewait_len" },
+ 	{ NET_IPV4_TCP_FIN_TIMEOUT,		"tcp_fin_timeout" },
+ 	/* NET_IPV4_IP_MASQ_DEBUG unused */
+ 	{ NET_TCP_SYNCOOKIES,			"tcp_syncookies" },
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index 76a03be..a701378 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -388,6 +388,15 @@ static struct ctl_table ipv4_table[] = {
+ 		.proc_handler	= proc_dointvec
+ 	},
+ 	{
++		.ctl_name	= NET_IPV4_TCP_TIMEWAIT_LEN,
++		.procname	= "tcp_timewait_len",
++		.data		= &sysctl_tcp_timewait_len,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_jiffies,
++		.strategy	= sysctl_jiffies
++	},
++	{
+ 		.ctl_name	= NET_IPV4_TCP_FIN_TIMEOUT,
+ 		.procname	= "tcp_fin_timeout",
+ 		.data		= &sysctl_tcp_fin_timeout,
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index f29d6b6..53d751a 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1995,9 +1995,9 @@ adjudge_to_death:
+ 		} else {
+ 			const int tmo = tcp_fin_time(sk);
+ 
+-			if (tmo > TCP_TIMEWAIT_LEN) {
++			if (tmo > sysctl_tcp_timewait_len) {
+ 				inet_csk_reset_keepalive_timer(sk,
+-						tmo - TCP_TIMEWAIT_LEN);
++						tmo - sysctl_tcp_timewait_len);
+ 			} else {
+ 				tcp_time_wait(sk, TCP_FIN_WAIT2, tmo);
+ 				goto out;
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 5ed9722..b29b0fb 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -5886,8 +5886,8 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+ 					}
+ 
+ 					tmo = tcp_fin_time(sk);
+-					if (tmo > TCP_TIMEWAIT_LEN) {
+-						inet_csk_reset_keepalive_timer(sk, tmo - TCP_TIMEWAIT_LEN);
++					if (tmo > sysctl_tcp_timewait_len) {
++						inet_csk_reset_keepalive_timer(sk, tmo - sysctl_tcp_timewait_len);
+ 					} else if (th->fin || sock_owned_by_user(sk)) {
+ 						/* Bad case. We could lose such FIN otherwise.
+ 						 * It is not a big problem, but it looks confusing
+diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+index 6cdc341..a3920a1 100644
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -32,6 +32,8 @@
+ #define SYNC_INIT 1
+ #endif
+ 
++int sysctl_tcp_timewait_len __read_mostly = TCP_TIMEWAIT_LEN;
++
+ int sysctl_tcp_syncookies __read_mostly = SYNC_INIT;
+ EXPORT_SYMBOL(sysctl_tcp_syncookies);
+ 
+@@ -111,6 +113,7 @@ tcp_timewait_state_process(struct inet_timewait_sock *tw, struct sk_buff *skb,
+ 		}
+ 	}
+ 
++	tcp_death_row.period = sysctl_tcp_timewait_len / INET_TWDR_TWKILL_SLOTS;
+ 	if (tw->tw_substate == TCP_FIN_WAIT2) {
+ 		/* Just repeat all the checks of tcp_rcv_state_process() */
+ 
+@@ -163,10 +166,10 @@ kill_with_rst:
+ 		    tcp_death_row.sysctl_tw_recycle && tcptw->tw_ts_recent_stamp &&
+ 		    tcp_v4_tw_remember_stamp(tw))
+ 			inet_twsk_schedule(tw, &tcp_death_row, tw->tw_timeout,
+-					   TCP_TIMEWAIT_LEN);
++					   sysctl_tcp_timewait_len);
+ 		else
+-			inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
+-					   TCP_TIMEWAIT_LEN);
++			inet_twsk_schedule(tw, &tcp_death_row, sysctl_tcp_timewait_len,
++					   sysctl_tcp_timewait_len);
+ 		return TCP_TW_ACK;
+ 	}
+ 
+@@ -204,8 +207,8 @@ kill:
+ 				return TCP_TW_SUCCESS;
+ 			}
+ 		}
+-		inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
+-				   TCP_TIMEWAIT_LEN);
++		inet_twsk_schedule(tw, &tcp_death_row, sysctl_tcp_timewait_len,
++				   sysctl_tcp_timewait_len);
+ 
+ 		if (tmp_opt.saw_tstamp) {
+ 			tcptw->tw_ts_recent	  = tmp_opt.rcv_tsval;
+@@ -255,8 +258,8 @@ kill:
+ 		 * Do not reschedule in the last case.
+ 		 */
+ 		if (paws_reject || th->ack)
+-			inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
+-					   TCP_TIMEWAIT_LEN);
++			inet_twsk_schedule(tw, &tcp_death_row, sysctl_tcp_timewait_len,
++					   sysctl_tcp_timewait_len);
+ 
+ 		/* Send ACK. Note, we do not put the bucket,
+ 		 * it will be released by caller.
+@@ -276,6 +279,7 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
+ 	const struct inet_connection_sock *icsk = inet_csk(sk);
+ 	const struct tcp_sock *tp = tcp_sk(sk);
+ 	int recycle_ok = 0;
++	tcp_death_row.period = sysctl_tcp_timewait_len / INET_TWDR_TWKILL_SLOTS;
+ 
+ 	if (tcp_death_row.sysctl_tw_recycle && tp->rx_opt.ts_recent_stamp)
+ 		recycle_ok = icsk->icsk_af_ops->remember_stamp(sk);
+@@ -338,13 +342,13 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
+ 		if (recycle_ok) {
+ 			tw->tw_timeout = rto;
+ 		} else {
+-			tw->tw_timeout = TCP_TIMEWAIT_LEN;
++			tw->tw_timeout = sysctl_tcp_timewait_len;
+ 			if (state == TCP_TIME_WAIT)
+-				timeo = TCP_TIMEWAIT_LEN;
++				timeo = sysctl_tcp_timewait_len;
+ 		}
+ 
+ 		inet_twsk_schedule(tw, &tcp_death_row, timeo,
+-				   TCP_TIMEWAIT_LEN);
++				   sysctl_tcp_timewait_len);
+ 		inet_twsk_put(tw);
+ 	} else {
+ 		/* Sorry, if we're out of memory, just CLOSE this
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index a4191bd..d157445 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -83,7 +83,7 @@ static int tcp_out_of_resources(struct sock *sk, int do_reset)
+ 
+ 		/* Catch exceptional cases, when connection requires reset.
+ 		 *      1. Last segment was sent recently. */
+-		if ((s32)(tcp_time_stamp - tp->lsndtime) <= TCP_TIMEWAIT_LEN ||
++		if ((s32)(tcp_time_stamp - tp->lsndtime) <= sysctl_tcp_timewait_len ||
+ 		    /*  2. Window is closed. */
+ 		    (!tp->snd_wnd && !tp->packets_out))
+ 			do_reset = 1;
+@@ -500,7 +500,7 @@ static void tcp_keepalive_timer (unsigned long data)
+ 
+ 	if (sk->sk_state == TCP_FIN_WAIT2 && sock_flag(sk, SOCK_DEAD)) {
+ 		if (tp->linger2 >= 0) {
+-			const int tmo = tcp_fin_time(sk) - TCP_TIMEWAIT_LEN;
++			const int tmo = tcp_fin_time(sk) - sysctl_tcp_timewait_len;
+ 
+ 			if (tmo > 0) {
+ 				tcp_time_wait(sk, TCP_FIN_WAIT2, tmo);
